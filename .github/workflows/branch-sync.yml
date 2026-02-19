@@ -1,0 +1,162 @@
+name: Branch Sync
+
+# Allow to write access for pushes to protected branches
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - master
+      - stage
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which branch sync job to run (merge-master, merge-stage, merge-release)'
+        required: true
+        default: 'merge-master'
+        type: string
+      branch:
+        description: '(Optional) Branch to target for manual dispatch (e.g., release/1.2.3)'
+        required: false
+        type: string
+
+jobs:
+  merge-master:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'merge-master') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+          persist-credentials: false
+
+      - name: Set Git identity
+        run: |
+          git config user.name "yeifabgm"
+          git config user.email "yeison.gutierrez@simetrik.com"
+
+      - name: Merge master into stage and support
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.BYPASS_TOKEN }}@github.com/${{ github.repository }}.git
+          git fetch origin --prune
+          TARGETS=("stage" "support")
+          for DEST in "${TARGETS[@]}"; do
+            echo "→ Processing $DEST"
+            git checkout -B "$DEST" "origin/$DEST"
+            git config merge.ours.driver true
+            if git merge --no-commit --no-ff origin/master; then
+              if git diff-index --quiet HEAD --; then
+                git merge --abort || true
+                echo "✅ No changes to merge into $DEST"
+              else
+                git commit --no-edit
+                git push origin $DEST
+              fi
+            else
+              git merge --abort
+              echo "::error::Conflict merging master into ${DEST}"
+              PAYLOAD="{\"text\":\":warning: Conflict merging *master* into *${DEST}* in \`${{ github.repository }}\`.\n• Repo: <https://github.com/${{ github.repository }}|${{ github.repository }}>\n• Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>\n• Team: ${{ secrets.SLACK_GROUP_TEAM }}\"}"
+              curl -fsS -X POST -H 'Content-Type: application/json' --data "$PAYLOAD" ${{ secrets.SLACK_WEBHOOK_URL }}
+              exit 1
+            fi
+          done
+        continue-on-error: false
+
+  merge-stage:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'merge-stage') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/stage')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout stage
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: stage
+          persist-credentials: false
+
+      - name: Set Git identity
+        run: |
+          git config user.name "yeifabgm"
+          git config user.email "yeison.gutierrez@simetrik.com"
+
+      - name: Merge stage into all release branches, develop-minor and develop
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.BYPASS_TOKEN }}@github.com/${{ github.repository }}.git
+          git fetch origin --prune
+          # Collect all release branches
+          RELEASE_REMOTES=$(git branch -r | grep "origin/release/" || true)
+          TARGET_REMOTES=($RELEASE_REMOTES origin/develop-minor origin/develop)
+          for remote in "${TARGET_REMOTES[@]}"; do
+            branch=${remote#origin/}
+            echo "→ Processing $remote → local branch $branch"
+            git checkout -B "$branch" "$remote"
+            git config merge.ours.driver true
+            if git merge --no-commit --no-ff origin/stage; then
+              if git diff-index --quiet HEAD --; then
+                git merge --abort || true
+                echo "✅ No changes to merge into $branch"
+              else
+                git commit --no-edit
+                git push origin $branch
+              fi
+            else
+              git merge --abort
+              echo "::error::Conflict merging stage into ${branch}"
+              PAYLOAD="{\"text\":\":warning: Conflict merging *stage* into *${branch}* in \`${{ github.repository }}\`.\n• Repo: <https://github.com/${{ github.repository }}|${{ github.repository }}>\n• Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>\n• Team: ${{ secrets.SLACK_GROUP_TEAM }}\"}"
+              curl -fsS -X POST -H 'Content-Type: application/json' --data "$PAYLOAD" ${{ secrets.SLACK_WEBHOOK_URL }}
+              exit 1
+            fi
+          done
+        continue-on-error: false
+
+  merge-release:
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.job == 'merge-release') || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/')) }}
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+          persist-credentials: false
+
+      - name: Set Git identity
+        run: |
+          git config user.name "yeifabgm"
+          git config user.email "yeison.gutierrez@simetrik.com"
+
+      - name: Merge release into develop and develop-minor
+        run: |
+          git remote set-url origin https://x-access-token:${{ secrets.BYPASS_TOKEN }}@github.com/${{ github.repository }}.git
+          git fetch origin --prune
+          DESTS=("develop" "develop-minor")
+          for DEST in "${DESTS[@]}"; do
+            echo "→ Processing ${DEST}"
+            git checkout -B "${DEST}" "origin/${DEST}"
+            git config merge.ours.driver true
+            if git merge --no-commit --no-ff "origin/${RELEASE_BRANCH}"; then
+              if git diff-index --quiet HEAD --; then
+                git merge --abort || true
+                echo "✅ No changes to merge into ${DEST}"
+              else
+                git commit --no-edit
+                git push origin ${DEST}
+              fi
+            else
+              git merge --abort
+              echo "::error::Conflict merging ${RELEASE_BRANCH} into ${DEST}"
+              PAYLOAD="{\"text\":\":warning: Conflict merging *${RELEASE_BRANCH}* into *${DEST}* in \`${{ github.repository }}\`.\n• Repo: <https://github.com/${{ github.repository }}|${{ github.repository }}>\n• Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_id }}>\n• Team: ${{ secrets.SLACK_GROUP_TEAM }}\"}"
+              curl -fsS -X POST -H 'Content-Type: application/json' --data "$PAYLOAD" ${{ secrets.SLACK_WEBHOOK_URL }}
+              exit 1
+            fi
+          done
+        continue-on-error: false
